@@ -40,6 +40,7 @@ const EOF = Buffer.alloc(1024)
 const ONSTAT = Symbol('onStat')
 const ENDED = Symbol('ended')
 const QUEUE = Symbol('queue')
+const PENDINGLINKS = Symbol('queue')
 const CURRENT = Symbol('current')
 const PROCESS = Symbol('process')
 const PROCESSING = Symbol('processing')
@@ -60,7 +61,7 @@ const ONDRAIN = Symbol('ondrain')
 
 import path from 'path'
 import { normalizeWindowsPath } from './normalize-windows-path.js'
-import type { TarOptions } from './options.js'
+import type { LinkCacheKey, TarOptions } from './options.js'
 
 export class Pack
   extends Minipass<Buffer, ReadEntry | string, WarnEvent<Buffer>>
@@ -98,6 +99,7 @@ export class Pack
   // class, but then we'd have to be tracking the tail of the queue the
   // whole time, and Yallist just does that for us anyway.
   [QUEUE]: Yallist<PackJob>;
+  [PENDINGLINKS] = new Map<LinkCacheKey, PackJob[]>();
   [JOBS]: number = 0;
   [PROCESSING]: boolean = false;
   [ENDED]: boolean = false
@@ -279,15 +281,23 @@ export class Pack
     } else if (
       stat.isFile() &&
       stat.nlink > 1 &&
-      job === this[CURRENT] &&
       !this.linkCache.get(`${stat.dev}:${stat.ino}`) &&
       !this.sync
     ) {
-      // if it's not filtered, and it's a new File entry,
-      // jump the queue in case any pending Link entries are about
-      // to try to link to it. This prevents a hardlink from coming ahead
-      // of its target in the archive.
-      this[PROCESSJOB](job)
+      // if it's not filtered, and it's a new File entry, and next anyway
+      // process right away in case any pending Link entries are about
+      // to try to link to it.
+      if (job === this[CURRENT]) {
+        this[PROCESSJOB](job)
+      } else {
+        // if it's NOT the current entry, it needs to be deferred,
+        // so that the link target can be built first.
+        const key: LinkCacheKey = `${stat.dev}:${stat.ino}`
+        const pending = this[PENDINGLINKS].get(key)
+        if (pending) pending.push(job)
+        else this[PENDINGLINKS].set(key, [job])
+        job.pending = true
+      }
     }
 
     this[PROCESS]()
@@ -347,9 +357,22 @@ export class Pack
     return this[QUEUE] && this[QUEUE].head && this[QUEUE].head.value
   }
 
-  [JOBDONE](_job: PackJob) {
+  [JOBDONE](job: PackJob) {
     this[QUEUE].shift()
     this[JOBS] -= 1
+    const { stat } = job
+    if (stat && stat.isFile() && stat.nlink > 1) {
+      // might be a file with pending links
+      const key: LinkCacheKey = `${stat.dev}:${stat.ino}`
+      const pending = this[PENDINGLINKS].get(key)
+      this[PENDINGLINKS].delete(key)
+      if (pending) {
+        for (const job of pending) {
+          job.pending = false
+          this[PROCESSJOB](job)
+        }
+      }
+    }
     this[PROCESS]()
   }
 

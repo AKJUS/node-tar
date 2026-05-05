@@ -3,6 +3,7 @@ import { Pack, PackSync } from '../dist/esm/pack.js'
 import fs from 'fs'
 import path, { resolve } from 'path'
 import { fileURLToPath } from 'url'
+import { Parser } from '../src/parse.js'
 
 import { Header } from '../dist/esm/header.js'
 import zlib from 'zlib'
@@ -1818,4 +1819,73 @@ t.test('prefix and hard links', t => {
   })
 
   t.end()
+})
+
+// https://github.com/isaacs/node-tar/issues/448
+t.test('aggressive async link target timing', async t => {
+  const target = resolve(t.testdirName, 'pkgB/aaa.js')
+  t.chdir(
+    t.testdir({
+      output: {},
+      pkgB: {
+        'package.json': JSON.stringify({
+          name: 'pkgb',
+          version: '1.2.3',
+          main: './dist/index.js',
+        }),
+        'aaa.js': 'console.log("hello, world")',
+        'index.js': t.fixture('link', target),
+        'foo.js': t.fixture('link', target),
+        dist: {
+          'index.js': t.fixture('link', target),
+        },
+      },
+    }),
+  )
+  const { Pack } = await t.mockImport('../src/pack.js', {
+    fs: t.createMock(fs, {
+      // ensure that readdir is sorted, for test consistency
+      readdir: (...args) => {
+        const cb = args.pop()
+        fs.readdir(...args, (er, results) => {
+          return cb(
+            er,
+            results?.sort((a, b) => a.localeCompare(b, 'en')),
+          )
+        })
+      },
+      // make it take longer to stat the target, so it comes in last,
+      // even though it's typically first in the queue.
+      lstat: (path, cb) => {
+        if (path === target) {
+          setTimeout(() => fs.lstat(target, cb), 200)
+        } else {
+          return fs.lstat(path, cb)
+        }
+      },
+    }),
+  })
+  let sawFile = false
+  let sawLinks = 0
+  const p = new Pack({ jobs: 999 })
+    .add('pkgB')
+    .end()
+    .pipe(
+      new Parser({
+        onReadEntry(entry) {
+          if (entry.path === 'pkgB/aaa.js') {
+            sawFile = true
+            t.equal(entry.type, 'File')
+          } else if (entry.type === 'Link') {
+            t.equal(entry.linkpath, 'pkgB/aaa.js')
+            t.equal(sawFile, true)
+            sawLinks++
+          }
+          entry.resume()
+        },
+      }),
+    )
+  await new Promise(res => p.on('end', res))
+  t.equal(sawFile, true)
+  t.equal(sawLinks, 3)
 })
