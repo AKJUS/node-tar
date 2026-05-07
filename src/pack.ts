@@ -21,6 +21,7 @@ export class PackJob {
   stat?: Stats
   readdir?: string[]
   pending: boolean = false
+  pendingLink: boolean = false
   ignore: boolean = false
   piped: boolean = false
   constructor(path: string, absolute: string) {
@@ -296,6 +297,7 @@ export class Pack
         const pending = this[PENDINGLINKS].get(key)
         if (pending) pending.push(job)
         else this[PENDINGLINKS].set(key, [job])
+        job.pendingLink = true
         job.pending = true
       }
     }
@@ -365,8 +367,8 @@ export class Pack
       // might be a file with pending links
       const key: LinkCacheKey = `${stat.dev}:${stat.ino}`
       const pending = this[PENDINGLINKS].get(key)
-      this[PENDINGLINKS].delete(key)
       if (pending) {
+        this[PENDINGLINKS].delete(key)
         for (const job of pending) {
           job.pending = false
           this[PROCESSJOB](job)
@@ -377,6 +379,12 @@ export class Pack
   }
 
   [PROCESSJOB](job: PackJob) {
+    if (job.pending && job.pendingLink && job === this[CURRENT]) {
+      // At least one of the links to this file are not being included
+      // in the tarball, so we need to just proceed.
+      job.pending = false
+      job.pendingLink = false
+    }
     if (job.pending) {
       return
     }

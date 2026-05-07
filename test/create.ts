@@ -1,13 +1,12 @@
-import fs from 'fs'
+import fs from 'node:fs'
+import fsp from 'node:fs/promises'
 import { mkdirp } from 'mkdirp'
-import path from 'path'
+import path from 'node:path'
 import { rimraf } from 'rimraf'
 import type { Test } from 'tap'
 import t from 'tap'
 import { c, list, Pack, PackSync } from '../dist/esm/index.js'
 import { spawn } from 'child_process'
-//@ts-ignore
-import mutateFS from 'mutate-fs'
 import { fileURLToPath } from 'url'
 
 const isWindows = process.platform === 'win32'
@@ -174,19 +173,47 @@ t.test('create', t => {
   t.end()
 })
 
-t.test('open fails', t => {
+t.test('open fails', async t => {
   const poop = new Error('poop')
   const file = path.resolve(dir, 'throw-open.tar')
-  t.teardown(mutateFS.statFail(poop))
-  t.throws(() =>
-    c(
-      {
-        file: file,
-        sync: true,
-        cwd: __dirname,
-      },
-      [path.basename(__filename)],
-    ),
+  const cbFail = (...args: any[]) =>
+    (args[args.length - 1] as Function)(poop)
+  const syncFail = () => {
+    throw poop
+  }
+  const asyncFail = async () => syncFail()
+  const { create } = await t.mockImport<typeof import('../src/create.js')>(
+    '../src/create.js',
+    {
+      fs: t.createMock(fs, {
+        open: cbFail,
+        stat: cbFail,
+        lstat: cbFail,
+        fstat: cbFail,
+        openSync: syncFail,
+        statSync: syncFail,
+        lstatSync: syncFail,
+        fstatSync: syncFail,
+      }),
+      'fs/promises': t.createMock(fsp, {
+        open: asyncFail,
+        stat: asyncFail,
+        lstat: asyncFail,
+        fstat: asyncFail,
+      }),
+    },
+  )
+  t.throws(
+    () =>
+      create(
+        {
+          file,
+          sync: true,
+          cwd: __dirname,
+        },
+        [path.basename(__filename)],
+      ),
+    poop,
   )
   t.throws(() => fs.lstatSync(file))
   t.end()

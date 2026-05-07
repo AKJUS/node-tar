@@ -1889,3 +1889,73 @@ t.test('aggressive async link target timing', async t => {
   t.equal(sawFile, true)
   t.equal(sawLinks, 3)
 })
+
+// regression in PENDINGLINKS update, if only ONE hardlink is seen
+// it'll be treated as the "link" if not current entry, and deferred
+// forever.
+t.test('avoid permanent link deferral', async t => {
+  const target = resolve(t.testdirName, 'externalTarget')
+  t.chdir(
+    t.testdir({
+      output: {},
+      externalTarget: 'hello',
+      pkgB: {
+        'package.json': JSON.stringify({
+          name: 'pkgb',
+          version: '1.2.3',
+          main: './dist/index.js',
+        }),
+        'aaa.js': 'console.log("hello, world")',
+        'index.js': t.fixture('link', target),
+        'foo.js': t.fixture('link', target),
+        dist: {
+          'index.js': t.fixture('link', target),
+        },
+      },
+    }),
+  )
+  const { Pack } = await t.mockImport('../src/pack.js', {
+    fs: t.createMock(fs, {
+      // ensure that readdir is sorted, for test consistency
+      readdir: (...args) => {
+        const cb = args.pop()
+        fs.readdir(...args, (er, results) => {
+          return cb(
+            er,
+            results?.sort((a, b) => a.localeCompare(b, 'en')),
+          )
+        })
+      },
+      // make it take longer to stat the target, so it comes in last,
+      // even though it's typically first in the queue.
+      lstat: (path, cb) => {
+        if (path === target) {
+          setTimeout(() => fs.lstat(target, cb), 200)
+        } else {
+          return fs.lstat(path, cb)
+        }
+      },
+    }),
+  })
+
+  const links = new Set()
+  const p = new Pack({ jobs: 999 })
+    .add('pkgB')
+    .end()
+    .pipe(
+      new Parser({
+        onReadEntry(entry) {
+          if (entry.type === 'Link') {
+            links.add(entry.path)
+            links.add(entry.linkpath)
+          }
+          entry.resume()
+        },
+      }),
+    )
+  await new Promise(res => p.on('end', res))
+  t.strictSame(
+    links,
+    new Set(['pkgB/index.js', 'pkgB/foo.js', 'pkgB/dist/index.js']),
+  )
+})
